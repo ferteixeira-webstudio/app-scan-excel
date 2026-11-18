@@ -8,7 +8,11 @@
  *   APP_TOKEN   (opcional)     senha do link; se definida, o site precisa abrir com #k=SENHA
  */
 const FOLDER_ID = '1hFIWg7atFwlTF1kYCBi1SjG79A56Ya1P';
-const MODEL = 'gemini-3.8-flash';
+/* IA: tenta do modelo mais rápido ao mais pesado; ocupado (429/5xx) → passa ao próximo na hora.
+   Nas medições de nov/2026 o Flash-Lite respondeu em 0,5–2 s; os Flash maiores davam 503 após 24–98 s.
+   Propriedade opcional GEMINI_MODEL: modelo tentado antes da cadeia. */
+const CADEIA = ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
+const ORCAMENTO_MS = 90000;
 
 const TYPES = {
   reagentes: { label: 'Reagentes', sheet: 'Planilha de Reagentes', photos: 'Fotos Reagentes' },
@@ -67,29 +71,46 @@ function analyze(req) {
     'Qualquer outra informação impressa (data de fabricação, CAS, nº de risco, classe, grupo de embalagem, especificações, armazenamento) ' +
     'deve ir em "obs", separada por " | ". Use "---" em "obs" somente se não houver nada. Não invente: se não estiver legível, use "N/A".';
 
-  const body = JSON.stringify({
+  const corpo = {
     contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: req.mime || 'image/jpeg', data: req.data } }] }],
-    generationConfig: { responseMimeType: 'application/json' }
-  });
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent';
-  const waits = [3000, 6000, 12000];
-  let j;
-  for (let i = 0; ; i++) {
-    const r = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key }, payload: body, muteHttpExceptions: true });
-    j = JSON.parse(r.getContentText());
-    if (!j.error) break;
-    const code = j.error.code, msg = j.error.message || '';
-    const m = /retry in\s+([\d.]+)s/i.exec(msg);
-    if (code === 429 || /quota|RESOURCE_EXHAUSTED/i.test(msg)) {
-      if (m && parseFloat(m[1]) <= 60 && i < waits.length) { Utilities.sleep(Math.ceil(parseFloat(m[1])) * 1000 + 1000); continue; }
-      throw new Error('Limite de uso da IA atingido. Tente novamente mais tarde.');
-    }
-    if (([500, 503, 504].indexOf(code) >= 0 || /high demand|overloaded|unavailable/i.test(msg)) && i < waits.length) { Utilities.sleep(waits[i]); continue; }
-    throw new Error('Gemini: ' + msg);
-  }
+    generationConfig: { responseMimeType: 'application/json', thinkingConfig: { thinkingLevel: 'low' } }
+  };
+  const j = geminiCadeia_(key, corpo);
   const p = j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts;
   if (!p || !p[0] || !p[0].text) throw new Error('A IA não retornou um resultado válido. Tente com boa iluminação.');
   return { data: JSON.parse(p[0].text.replace(/```json/g, '').replace(/```/g, '').trim()) };
+}
+
+/** Pede ao Gemini tentando os modelos em ordem. 404/429/5xx: marca o modelo como ocupado (5 min; 6 h se não existe) e vai ao próximo. */
+function geminiCadeia_(key, corpo) {
+  const props = PropertiesService.getScriptProperties(), cache = CacheService.getScriptCache(), ini = Date.now();
+  const cadeia = [props.getProperty('GEMINI_MODEL') || ''].concat(CADEIA).filter(function (m, i, a) { return m && a.indexOf(m) === i; });
+  const livres = cadeia.filter(function (m) { return !cache.get('gem_ocupado_' + m); });
+  const lista = livres.length ? livres : cadeia;
+  let code = 0, msg = '';
+  for (let i = 0; i < lista.length; i++) {
+    if (i > 0 && Date.now() - ini > ORCAMENTO_MS) break;
+    const m = lista[i], pl = JSON.parse(JSON.stringify(corpo));
+    const pedir = function () {
+      const r = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + m + ':generateContent',
+        { method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key }, payload: JSON.stringify(pl), muteHttpExceptions: true });
+      code = r.getResponseCode();
+      try { return JSON.parse(r.getContentText()); } catch (e) { return { error: { code: code, message: 'resposta inválida' } }; }
+    };
+    const t0 = Date.now();
+    let j = pedir();
+    if (j.error && code === 400 && /think/i.test(j.error.message || '')) { delete pl.generationConfig.thinkingConfig; j = pedir(); }
+    console.log('Gemini ' + m + ': HTTP ' + code + ' em ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s');
+    if (!j.error) return j;
+    msg = j.error.message || '';
+    const semModelo = code === 404 || (code === 400 && /model/i.test(msg) && !/API.?key/i.test(msg));
+    if (semModelo || code === 429 || code >= 500) { cache.put('gem_ocupado_' + m, String(code), semModelo ? 21600 : 300); continue; }
+    break; // chave ou pedido inválido: outro modelo não resolve
+  }
+  if (/API.?key|API_KEY_INVALID|PERMISSION_DENIED/i.test(msg)) throw new Error('O Google recusou a chave da API Gemini (propriedade GEMINI_KEY).');
+  if (code === 429) throw new Error('Limite de uso da IA atingido. Espere um minuto e tente de novo.');
+  if (code >= 500 || code === 0) throw new Error('A IA do Google está muito ocupada agora. Tente de novo em instantes.');
+  throw new Error('Gemini: ' + msg);
 }
 
 /* ---------- Drive / Planilhas ---------- */
