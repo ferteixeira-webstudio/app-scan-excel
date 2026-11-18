@@ -112,7 +112,7 @@ body{margin:0;min-height:100vh;font-family:'Outfit',system-ui,sans-serif;color:v
    <button type="button" data-t="insumos" onclick="setType('insumos')">📦 Insumos</button>
   </div>
   <div><h2 id="scan-title">Scan de Reagentes</h2>
-   <p class="hint" style="margin:0;font-size:14px">Fotografe ou envie o rótulo (até 10 arquivos por vez). A IA lê os dados, um arquivo de cada vez, e cada produto vira uma linha na sua planilha.</p></div>
+   <p class="hint" style="margin:0;font-size:14px">Fotografe ou envie o rótulo (até 10 arquivos por vez). A IA lê até 10 rótulos ao mesmo tempo; você confere um por um e cada produto vira uma linha na sua planilha.</p></div>
   <section class="stack">
    <label for="gkey" class="st">Chave da API Gemini</label>
    <div class="row">
@@ -124,8 +124,8 @@ body{margin:0;min-height:100vh;font-family:'Outfit',system-ui,sans-serif;color:v
   </section>
   <details class="hint"><summary class="st">Opções avançadas</summary>
    <label for="mname" class="st">Modelo da IA</label>
-   <div class="row"><input id="mname" type="text" placeholder="padrão: gemini-3.8-flash" class="field"><button type="button" onclick="saveModel()" class="btn soft pad">Usar</button></div>
-   <p id="mstat">Deixe em branco para o padrão.</p>
+   <div class="row"><input id="mname" type="text" placeholder="padrão: o mais rápido disponível" class="field"><button type="button" onclick="saveModel()" class="btn soft pad">Usar</button></div>
+   <p id="mstat">Deixe em branco para o padrão. O modelo escolhido é tentado primeiro; se estiver ocupado, o app passa para o próximo.</p>
   </details>
   <div id="auth" style="text-align:center">
    <button onclick="authClick()" class="btn main full" style="padding:14px;font-size:16px">Conectar com Google</button>
@@ -205,7 +205,10 @@ body{margin:0;min-height:100vh;font-family:'Outfit',system-ui,sans-serif;color:v
 
 <script>
 var CLIENT_ID = '855748596555-ungren4n59c97s9004ejuefo0rd1pgap.apps.googleusercontent.com';
-var MODEL = 'gemini-3.8-flash';
+/* IA: tenta do modelo mais rápido ao mais pesado; ocupado (429/5xx) ou demorado → passa ao próximo na hora.
+   Nas medições de nov/2026 o Flash-Lite respondeu em 0,5–2 s; os Flash maiores davam 503 após 24–98 s. */
+var CADEIA = ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
+var ORCAMENTO_MS = 90000, LIMITE_MODELO_MS = 40000, MAX_PX = 2048, MAX_SIMULT = 10;
 var SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
 var ROOT = '1hFIWg7atFwlTF1kYCBi1SjG79A56Ya1P';
 var S = 'https://sheets.googleapis.com/v4/spreadsheets/';
@@ -216,7 +219,7 @@ var TYPES = {
 };
 var HEAD = ['Nome do Produto', 'Data de Validade', 'Lote', 'Fabricante', 'Observação', 'Código do Produto', 'Data de Cadastro', 'Foto do Rótulo', 'Status de Validade'];
 var tok = null, client = null, cur = 'reagentes', busy = false, running = false, seq = 0, queue = [], items = [], fType = 'all', fSt = 'all', sheetInfo = null;
-var QL = { wait: '⏳ Na fila', work: '🔄 Em análise', ok: '✅ Salvo', dup: '⚠️ Repetido', skip: '⏭️ Descartado', err: '❌ Erro' };
+var QL = { wait: '⏳ Na fila', work: '🔄 Em análise', ready: '👀 Pronto para conferir', rev: '✏️ Em conferência', ok: '✅ Salvo', dup: '⚠️ Repetido', skip: '⏭️ Descartado', err: '❌ Erro' };
 var LAB = { venc: 'Vencido', soon: 'Vence em 30 dias', ok: 'Em dia', sem: 'Sem data' };
 
 function el(i) { return document.getElementById(i); }
@@ -269,7 +272,8 @@ function saveKey() {
   el('kstat').innerHTML = '<span style="color:#7dffb0">✅ Chave salva neste navegador.</span>';
 }
 function toggleKey() { var i = el('gkey'); i.type = i.type === 'password' ? 'text' : 'password'; }
-function getModel() { return (ls('gemini_model') || '').trim() || MODEL; }
+function getModel() { return (ls('gemini_model') || '').trim(); }
+function cadeia() { return [getModel()].concat(CADEIA).filter(function (m, i, a) { return m && a.indexOf(m) === i; }); }
 function saveModel() {
   var v = el('mname').value.trim();
   ss('gemini_model', v);
@@ -431,19 +435,65 @@ function toB64(file) {
     r.readAsDataURL(file);
   });
 }
-async function gemini(file, b64, key) {
-  var body = JSON.stringify({ contents: [{ parts: [{ text: promptText() }, { inline_data: { mime_type: file.type || 'image/jpeg', data: b64 } }] }], generationConfig: { responseMimeType: 'application/json' } });
-  var waits = [3000, 6000, 12000];
-  for (var a = 0; ; a++) {
-    var r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + getModel() + ':generateContent', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: body });
-    var j = await r.json();
+function ocupado(m) { return (+ls('gem_ocupado_' + m) || 0) > Date.now(); }
+function marcarOcupado(m, ms) { ss('gem_ocupado_' + m, String(Date.now() + ms)); }
+/* Foto grande do celular vira JPEG de até 2048 px só para a IA (envio muito menor); o arquivo original vai para o Drive. */
+async function paraIA(file) {
+  var orig = { mime: file.type || 'image/jpeg', b64: null };
+  if ((file.type || '').indexOf('image/') !== 0 || /hei[cf]/i.test(file.type)) { orig.b64 = await toB64(file); return orig; }
+  try {
+    var bmp = await createImageBitmap(file), sc = Math.min(1, MAX_PX / Math.max(bmp.width, bmp.height));
+    if (sc === 1 && file.size < 1.5 * 1048576) { if (bmp.close) bmp.close(); orig.b64 = await toB64(file); return orig; }
+    var c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * sc); c.height = Math.round(bmp.height * sc);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    if (bmp.close) bmp.close();
+    return { mime: 'image/jpeg', b64: c.toDataURL('image/jpeg', 0.88).split(',')[1] };
+  } catch (e) { orig.b64 = await toB64(file); return orig; }
+}
+async function pedirModelo(m, corpo, key) {
+  var ctl = new AbortController(), t = setTimeout(function () { ctl.abort(); }, LIMITE_MODELO_MS);
+  try {
+    var r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + m + ':generateContent',
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(corpo), signal: ctl.signal });
+    return await r.json().catch(function () { return { error: { code: r.status, message: 'resposta inválida' } }; });
+  } catch (e) {
+    return { error: e.name === 'AbortError' ? { code: 504, message: 'tempo esgotado' } : { code: 0, message: 'sem conexão' } };
+  } finally { clearTimeout(t); }
+}
+async function gemini(img, key) {
+  var corpo = { contents: [{ parts: [{ text: promptText() }, { inline_data: { mime_type: img.mime, data: img.b64 } }] }],
+    generationConfig: { responseMimeType: 'application/json', thinkingConfig: { thinkingLevel: 'low' } } };
+  var lista = cadeia(), livres = lista.filter(function (m) { return !ocupado(m); }), ini = Date.now(), erro = null;
+  if (livres.length) lista = livres;
+  for (var i = 0; i < lista.length; i++) {
+    if (i > 0 && Date.now() - ini > ORCAMENTO_MS) break;
+    var m = lista[i], j = await pedirModelo(m, corpo, key);
+    if (j.error && j.error.code === 400 && /think/i.test(j.error.message || '')) {
+      var semTh = JSON.parse(JSON.stringify(corpo)); delete semTh.generationConfig.thinkingConfig;
+      j = await pedirModelo(m, semTh, key);
+    }
     if (!j.error) return j;
-    var c = j.error.code, msg = j.error.message || '';
-    if ([429, 500, 503, 504].indexOf(c) < 0 || a >= waits.length)
-      throw new Error(c === 429 ? 'Limite de uso da IA atingido. Tente mais tarde ou troque o modelo em "Opções avançadas".' : 'Gemini: ' + msg);
-    el('status').textContent = '⏳ A IA está ocupada, tentando de novo (' + (a + 1) + '/3)...';
-    await new Promise(function (x) { setTimeout(x, waits[a]); });
+    erro = j.error;
+    var c = erro.code, msg = erro.message || '';
+    var semModelo = c === 404 || (c === 400 && /model/i.test(msg) && !/API.?key/i.test(msg));
+    if (semModelo || c === 429 || c >= 500 || c === 0) { if (c !== 0) marcarOcupado(m, semModelo ? 6 * 3600000 : 300000); continue; }
+    break; // chave ou pedido inválido: outro modelo não resolve
   }
+  var c2 = erro ? erro.code : 0, m2 = erro ? erro.message || '' : '';
+  if (/API.?key|API_KEY_INVALID|PERMISSION_DENIED/i.test(m2)) throw new Error('O Google recusou a chave da API Gemini. Confira a chave salva acima.');
+  if (c2 === 0) throw new Error('Sem conexão com a IA. Confira a internet e tente de novo.');
+  if (c2 === 429) throw new Error('Limite de uso da IA atingido. Espere um minuto e envie de novo.');
+  if (c2 >= 500) throw new Error('A IA do Google está muito ocupada agora. Tente de novo em instantes.');
+  throw new Error('Gemini: ' + m2);
+}
+async function analisar(file, key) {
+  var g = await gemini(await paraIA(file), key);
+  var parts = g.candidates && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts;
+  var texto = parts ? parts.map(function (p) { return p.thought ? '' : (p.text || ''); }).join('') : '';
+  if (!texto) throw new Error('A IA não retornou um resultado válido. Tente com boa iluminação.');
+  try { return JSON.parse(texto.replace(/```json/g, '').replace(/```/g, '').trim()); }
+  catch (e) { throw new Error('A IA respondeu fora do formato. Envie a foto de novo.'); }
 }
 var FIELDS = [['nome', 'Nome do Produto'], ['validade', 'Data de Validade'], ['lote', 'Lote'], ['fabricante', 'Fabricante'], ['obs', 'Observação'], ['codigo', 'Código do Produto']];
 function review(data) {
@@ -464,14 +514,10 @@ function review(data) {
     el('rcancel').onclick = function () { done(null); };
   });
 }
-async function processOne(file, key) {
+async function conferir(item) {
+  var file = item.file, data = item.data;
   if ((file.type || '').indexOf('image/') === 0) { el('prev').src = URL.createObjectURL(file); el('pbox').classList.remove('hidden'); }
   else el('pbox').classList.add('hidden');
-  el('status').textContent = '⏳ Analisando imagem com IA...';
-  var g = await gemini(file, await toB64(file), key);
-  var parts = g.candidates && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts;
-  if (!parts || !parts[0] || !parts[0].text) throw new Error('A IA não retornou um resultado válido. Tente com boa iluminação.');
-  var data = JSON.parse(parts[0].text.replace(/```json/g, '').replace(/```/g, '').trim());
   var rv = await review(data);
   if (!rv) { data._skipped = true; return data; }
   Object.assign(data, rv);
@@ -480,13 +526,15 @@ async function processOne(file, key) {
   return data;
 }
 
-/* ---------- fila ---------- */
-function pending() { return queue.filter(function (q) { return q.state === 'wait' || q.state === 'work'; }).length; }
+/* ---------- fila: a IA analisa até 10 ao mesmo tempo; a conferência e o salvamento seguem um por um ---------- */
+var ATIVOS = ['wait', 'work', 'ready', 'rev'], acordarFn = null;
+function pending() { return queue.filter(function (q) { return ATIVOS.indexOf(q.state) >= 0; }).length; }
+function acordar() { if (acordarFn) { var f = acordarFn; acordarFn = null; f(); } }
 function renderQueue() {
   var b = el('qbox');
   if (!queue.length) { b.classList.add('hidden'); b.innerHTML = ''; return; }
   b.classList.remove('hidden');
-  b.innerHTML = '<p class="st" style="margin:0">Fila de análise · ' + pending() + ' de 10 vagas ocupadas</p>' +
+  b.innerHTML = '<p class="st" style="margin:0">Fila de análise · ' + pending() + ' de ' + MAX_SIMULT + ' vagas ocupadas</p>' +
     queue.map(function (q) {
       return '<div class="qi"><span class="qn">' + esc(q.file.name || 'foto') + '</span><span>' + QL[q.state] + '</span>' +
         (q.state === 'wait' ? '<button type="button" onclick="unqueue(' + q.id + ')">✕</button>' : '') + '</div>';
@@ -494,31 +542,51 @@ function renderQueue() {
 }
 function unqueue(id) { queue = queue.filter(function (q) { return !(q.id === id && q.state === 'wait'); }); renderQueue(); }
 function pick(ev) { var f = Array.from(ev.target.files || []); ev.target.value = ''; handleFiles(f); }
+function analisarItem(item, key) {
+  item.state = 'work';
+  analisar(item.file, key).then(function (d) { item.data = d; item.state = 'ready'; }, function (e) { console.error(e); item.erro = e; item.state = 'err'; })
+    .then(function () { renderQueue(); acordar(); });
+}
 function handleFiles(files) {
   files = files.filter(function (f) { return (f.type || '').indexOf('image/') === 0 || f.type === 'application/pdf'; });
   if (!files.length) return;
   if (!tok) { el('astat').innerHTML = '<span style="color:#ff8a80">Conecte com o Google antes de enviar arquivos.</span>'; return; }
-  if (!getKey()) { el('status').innerHTML = '<span style="color:#ff8a80">❌ Cole sua chave da API Gemini no campo acima e clique em Salvar.</span>'; return; }
-  files.slice(0, Math.max(0, 10 - pending())).forEach(function (f) { queue.push({ id: ++seq, file: f, state: 'wait' }); });
+  var key = getKey();
+  if (!key) { el('status').innerHTML = '<span style="color:#ff8a80">❌ Cole sua chave da API Gemini no campo acima e clique em Salvar.</span>'; return; }
+  var vagas = Math.max(0, MAX_SIMULT - pending());
+  if (files.length > vagas) el('status').innerHTML = '<span style="color:#ffd77a">⚠️ Só cabem ' + MAX_SIMULT + ' na fila: ' + (files.length - vagas) + ' arquivo(s) ficaram de fora. Envie de novo quando a fila andar.</span>';
+  files.slice(0, vagas).forEach(function (f) { var it = { id: ++seq, file: f, state: 'wait' }; queue.push(it); analisarItem(it, key); });
   renderQueue(); runQueue();
 }
 async function runQueue() {
   if (running) return;
   running = true; busy = true;
-  var results = [], item;
-  while ((item = queue.find(function (q) { return q.state === 'wait'; }))) {
-    item.state = 'work'; renderQueue();
+  var results = [];
+  for (;;) {
+    queue.forEach(function (q) {
+      if (q.state === 'err' && !q.rep) { q.rep = true; results.push('<span style="color:#ff8a80">❌ ' + esc(q.file.name || 'foto') + ': ' + esc(q.erro.message) + '</span>'); }
+    });
+    var item = queue.find(function (q) { return q.state === 'ready'; });
+    if (!item) {
+      var analisando = queue.filter(function (q) { return q.state === 'work'; }).length;
+      if (!analisando) break;
+      el('status').textContent = '⏳ A IA está lendo ' + analisando + (analisando === 1 ? ' rótulo...' : ' rótulos ao mesmo tempo...');
+      await new Promise(function (r) { acordarFn = r; });
+      continue;
+    }
+    item.state = 'rev'; renderQueue();
     try {
-      var d = await processOne(item.file, getKey());
+      var d = await conferir(item);
       if (d._skipped) { item.state = 'skip'; results.push('⏭️ <b>' + esc(d.nome) + '</b> descartado.'); }
       else if (d._dup) { item.state = 'dup'; results.push('⚠️ <b>' + esc(d.nome) + '</b> já estava cadastrado.'); }
       else { item.state = 'ok'; results.push('✅ <b>' + esc(d.nome) + '</b> — validade ' + esc(d.validade) + ', lote ' + esc(d.lote) + (d._photoError ? '<br>⚠️ A foto não foi para o Drive (' + esc(d._photoError) + ').' : '')); }
     } catch (e) {
-      console.error(e); item.state = 'err';
+      console.error(e); item.state = 'err'; item.rep = true;
       results.push('<span style="color:#ff8a80">❌ ' + esc(item.file.name || 'foto') + ': ' + esc(e.message) + '</span>');
     }
     renderQueue();
   }
+  el('pbox').classList.add('hidden');
   el('status').innerHTML = '🎉 <b>Concluído!</b><br><br>' + results.join('<br>');
   queue = []; busy = false; running = false;
   renderQueue(); loadExpiry();
